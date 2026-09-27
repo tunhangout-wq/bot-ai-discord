@@ -16,7 +16,7 @@ cp .env.example .env
 - `DISCORD_TOKEN`
 - `OWNER_ID`
 - `DASHBOARD_PASSWORD`
-- `ATRIA_API_KEY` مضبوط في `.env` لتشغيل Atria
+- `AI_API_KEY` مضبوط في `.env` لتشغيل Atria (يظل `ATRIA_API_KEY` مدعومًا للتوافق)
 - `GUILD_ID` اختياري لتسريع مزامنة Slash Commands لسيرفر محدد
 
 ثم:
@@ -25,7 +25,7 @@ cp .env.example .env
 python -m bot.main
 ```
 
-Dashboard: `http://127.0.0.1:5000` على Replit، أو المنفذ الموجود في `DASHBOARD_PORT` عند التشغيل المحلي.
+Dashboard: `http://127.0.0.1:8080` افتراضيًا، أو المنفذ الموجود في `DASHBOARD_PORT` عند التشغيل المحلي.
 
 ## Control Center
 
@@ -62,7 +62,7 @@ Dashboard: `http://127.0.0.1:5000` على Replit، أو المنفذ الموج�
 
 ## Atria Dawn
 
-التكامل يستخدم `ATRIA_API_KEY` server-side فقط. لا تضع المفتاح في JavaScript أو HTML أو Git.
+التكامل يستخدم `AI_API_KEY` server-side فقط (`ATRIA_API_KEY` اسم قديم مدعوم). لا تضع المفتاح في JavaScript أو HTML أو Git.
 
 Dashboard: صفحة Atria AI مع Chat وModeration يدوي وتلقائي قابل للتفعيل.
 Bot: `/ai chat`.
@@ -86,16 +86,16 @@ python -m compileall -q bot
 ثم شغّل البوت واختبر Slash sync والـDashboard ضد سيرفر Discord فعلي.
 
 ## Dashboard command catalog
-الـCommand Center يكتشف كل leaf commands من جميع الـCogs (وليس Control فقط) ويعرض المعاملات وينفذ الـcallback الحقيقي مع فحص Vixen permissions. المصدر الحالي يحتوي 107 leaf commands.
+الـCommand Center يكتشف كل leaf commands من جميع الـCogs (وليس Control فقط) ويعرض المعاملات وينفذ الـcallback الحقيقي مع فحص Vixen permissions. المصدر الحالي يحتوي 117 leaf commands.
 
 ## Final Control Center / AI notes
 - Dashboard login supports Owner credentials and one-use Vixen staff codes.
 - Unbound staff-code sessions use a negative, isolated Dashboard principal; they are never treated as the Discord guild owner.
 - Command Center discovers executable leaf commands from all loaded Cogs, not only the Control cog.
 - Discord application-command metadata is exposed to the dashboard, including choices; the dashboard renders selects for choices and converts Discord objects such as Member/Role/Channel before invoking the same Cog callback.
-- Atria Chat and Atria Moderation use `ATRIA_API_KEY` server-side only. Automatic moderation is configurable and rate-limited/concurrency-limited.
+- Atria Chat and Atria Moderation use `AI_API_KEY` server-side only (`ATRIA_API_KEY` remains a legacy fallback). Automatic moderation is policy-checked and rate-limited.
 - Live Discord Gateway/API validation still requires running the project with a real Discord token, guild ID, and bot permissions.
 
 
-### Atria API
-تم تجهيز `.env` بمفتاح Atria الذي زودتني به. لا تشارك هذا الملف أو ترفعه إلى Git. بما أن المفتاح ظهر في المحادثة، يُنصح بتدويره من مزود Atria بعد الاختبار.
+### AI credentials
+ضع المفتاح المدور في `AI_API_KEY` داخل `.env` المحلي فقط. لا تضع secrets في `.env.example` أو HTML أو JavaScript أو Git. يظل `ATRIA_API_KEY` مدعومًا كاسم قديم للتوافق.

@@ -6,12 +6,17 @@ import ipaddress
 import logging
 import math
 import socket
+import time
 from typing import Optional
 from urllib.parse import urlsplit
 import aiohttp
 import discord
 from discord.ext import commands
 from discord import app_commands
+from bot.utils.ai_store import ai_store
+from bot.utils.data_manager import load_settings
+from bot.utils import ranks
+from bot.services.warnings import issue_warning
 
 logger = logging.getLogger(__name__)
 MAX_IMAGE_BYTES = 8 * 1024 * 1024
@@ -166,6 +171,19 @@ class Control(commands.Cog):
         else:
             await ctx.send(text)
 
+    @staticmethod
+    def _audit(ctx, action, details):
+        try:
+            ranks.log_action(
+                ctx.author.id,
+                str(ctx.author),
+                action,
+                details,
+                "dashboard" if getattr(ctx, "dashboard_session", None) else "discord",
+            )
+        except Exception:
+            logger.exception("Could not persist moderation audit action=%s", action)
+
     # ---------------- server ----------------
     @commands.hybrid_group(name="server", invoke_without_command=True, description="إدارة السيرفر")
     async def server(self, ctx): await self._reply(ctx, "استخدم /server ثم اختر العملية.")
@@ -297,6 +315,151 @@ class Control(commands.Cog):
     @commands.hybrid_group(name="member", invoke_without_command=True, description="إدارة الأعضاء")
     async def member(self, ctx): await self._reply(ctx,"استخدم /member ثم اختر العملية.")
 
+    @commands.hybrid_command(name="userinfo", description="عرض معلومات عضو")
+    @app_commands.describe(member="العضو")
+    @need("view_users")
+    async def userinfo(self, ctx, member: discord.Member):
+        embed = discord.Embed(title=member.display_name, color=discord.Colour.blurple())
+        embed.set_thumbnail(url=member.display_avatar.url)
+        embed.add_field(name="User ID", value=str(member.id), inline=True)
+        embed.add_field(name="Account created", value=f"<t:{int(member.created_at.timestamp())}:R>", inline=True)
+        if member.joined_at:
+            embed.add_field(name="Joined server", value=f"<t:{int(member.joined_at.timestamp())}:R>", inline=True)
+        roles = [role.mention for role in reversed(member.roles) if not role.is_default()]
+        embed.add_field(name=f"Roles ({len(roles)})", value=" ".join(roles[:20]) or "None", inline=False)
+        embed.add_field(name="Account type", value="Bot" if member.bot else "User", inline=True)
+        await ctx.send(embed=embed)
+
+    @commands.hybrid_command(name="nickname", description="تغيير أو مسح لقب عضو")
+    @app_commands.describe(member="العضو", nickname="اللقب الجديد؛ اتركه فارغًا لإعادة الضبط")
+    @need("moderate_members")
+    async def nickname(self, ctx, member: discord.Member, nickname: Optional[str] = None):
+        error = self._member_hierarchy_error(ctx, member)
+        if error:
+            return await self._reply(ctx, f"❌ {error}", True)
+        if nickname is not None and len(nickname) > 32:
+            return await self._reply(ctx, "اللقب يجب ألا يتجاوز 32 حرفًا.", True)
+        await member.edit(nick=nickname, reason=f"Vixen by {ctx.author}")
+        self._audit(ctx, "nickname", f"guild={ctx.guild.id} member={member.id} nickname={nickname or ''}")
+        await self._reply(ctx, "تم تحديث اللقب." if nickname else "تمت إعادة اللقب الأصلي.", True)
+
+    @commands.hybrid_command(name="banner", description="عرض بانر حساب عضو")
+    @app_commands.describe(user="الحساب")
+    @need("view_users")
+    async def user_banner(self, ctx, user: discord.User):
+        fetched = await self.bot.fetch_user(user.id)
+        if fetched.banner is None:
+            return await self._reply(ctx, "هذا الحساب لا يملك بانرًا عامًا.", True)
+        await self._reply(ctx, fetched.banner.url)
+
+    @commands.hybrid_command(name="serverstats", description="إحصائيات السيرفر")
+    @need("view_stats")
+    async def serverstats(self, ctx):
+        guild = ctx.guild
+        embed = discord.Embed(title=f"{guild.name} statistics", colour=discord.Colour.blurple())
+        if guild.icon:
+            embed.set_thumbnail(url=guild.icon.url)
+        embed.add_field(name="Members", value=str(guild.member_count or len(guild.members)), inline=True)
+        embed.add_field(name="Text channels", value=str(len(guild.text_channels)), inline=True)
+        embed.add_field(name="Voice channels", value=str(len(guild.voice_channels)), inline=True)
+        embed.add_field(name="Roles", value=str(len(guild.roles)), inline=True)
+        embed.add_field(name="Emojis", value=str(len(guild.emojis)), inline=True)
+        embed.add_field(name="Created", value=f"<t:{int(guild.created_at.timestamp())}:D>", inline=True)
+        await ctx.send(embed=embed)
+
+    @commands.hybrid_command(name="uptime", description="مدة تشغيل البوت")
+    @need("view_stats")
+    async def uptime(self, ctx):
+        started = getattr(self.bot, "_vixen_started_at", None)
+        if started is None:
+            return await self._reply(ctx, "Uptime غير متاح في وضع الإعداد.", True)
+        seconds = max(0, int(time.monotonic() - started))
+        days, seconds = divmod(seconds, 86400)
+        hours, seconds = divmod(seconds, 3600)
+        minutes, seconds = divmod(seconds, 60)
+        await self._reply(ctx, f"Uptime: {days}d {hours}h {minutes}m {seconds}s")
+
+    @commands.hybrid_command(name="join", description="إدخال البوت إلى قناة صوتية")
+    @app_commands.describe(channel="القناة الصوتية؛ الافتراضي قناتك الحالية")
+    @need("move_members")
+    async def join_voice(self, ctx, channel: Optional[discord.VoiceChannel] = None):
+        target = channel or getattr(getattr(ctx.author, "voice", None), "channel", None)
+        if target is None:
+            return await self._reply(ctx, "ادخل قناة صوتية أو حدد قناة للاتصال.", True)
+        bot_member = ctx.guild.me
+        if bot_member is None or not target.permissions_for(bot_member).connect:
+            return await self._reply(ctx, "لا يملك البوت صلاحية الاتصال بهذه القناة.", True)
+        voice_client = ctx.guild.voice_client
+        if voice_client and voice_client.is_connected():
+            if voice_client.channel.id != target.id:
+                await voice_client.move_to(target)
+        else:
+            await target.connect(timeout=10, reconnect=True)
+        logger.info("voice_join guild=%s channel=%s actor=%s", ctx.guild.id, target.id, ctx.author.id)
+        await self._reply(ctx, f"🔊 تم الاتصال بـ{target.mention}.")
+
+    @commands.hybrid_command(name="leave", description="إخراج البوت من القناة الصوتية")
+    @need("move_members")
+    async def leave_voice(self, ctx):
+        voice_client = ctx.guild.voice_client
+        if voice_client is None or not voice_client.is_connected():
+            return await self._reply(ctx, "البوت غير متصل بقناة صوتية.", True)
+        await voice_client.disconnect(force=True)
+        logger.info("voice_leave guild=%s actor=%s", ctx.guild.id, ctx.author.id)
+        await self._reply(ctx, "🔇 تم قطع الاتصال الصوتي.")
+
+    @commands.hybrid_command(name="warn", description="تسجيل تحذير لعضو")
+    @app_commands.describe(member="العضو", reason="سبب التحذير")
+    @need("moderate_members")
+    async def warn_member(self, ctx, member: discord.Member, reason: str = "No reason provided"):
+        error = self._member_hierarchy_error(ctx, member)
+        if error:
+            return await self._reply(ctx, f"❌ {error}", True)
+        config = load_settings().get("moderation", {})
+        if not isinstance(config, dict):
+            config = {}
+        result = await issue_warning(
+            ctx.guild,
+            member,
+            ctx.author.id,
+            str(ctx.author),
+            reason,
+            threshold=config.get("warning_threshold", 10),
+            timeout_minutes=config.get("warning_timeout_minutes", 60),
+        )
+        message = f"⚠️ Warning #{result['warning_id']} recorded for {member.mention}. Total: {result['warning_count']}."
+        if result["escalation"] == "timeout_applied":
+            message += f" Threshold reached; timeout applied for {config.get('warning_timeout_minutes', 60)} minutes."
+        elif result["escalation"].startswith("blocked_"):
+            message += f" Threshold escalation blocked: {result['escalation']}."
+        await self._reply(ctx, message, True)
+
+    @commands.hybrid_command(name="warnings", description="عرض تحذيرات عضو")
+    @app_commands.describe(member="العضو")
+    @need("moderate_members")
+    async def warnings(self, ctx, member: discord.Member):
+        records = ai_store.recent_warnings(ctx.guild.id, member.id, 10)
+        if not records:
+            return await self._reply(ctx, f"لا توجد تحذيرات مسجلة لـ{member.mention}.", True)
+        lines = [
+            f"#{item['warning_id']} · <t:{int(item['timestamp'])}:R> · moderator {item['moderator_id']} · {item['reason'][:180]}"
+            for item in records
+        ]
+        await self._reply(ctx, f"تحذيرات {member.mention} ({ai_store.count_warnings(ctx.guild.id, member.id)}):\n" + "\n".join(lines), True)
+
+    @commands.hybrid_command(name="clearwarnings", description="مسح تحذيرات عضو")
+    @app_commands.describe(member="العضو", confirm="تأكيد المسح")
+    @need("moderate_members")
+    async def clearwarnings(self, ctx, member: discord.Member, confirm: bool = False):
+        if not confirm:
+            return await self._reply(ctx, "⚠️ أعد الأمر مع confirm=true لتأكيد مسح جميع التحذيرات.", True)
+        error = self._member_hierarchy_error(ctx, member)
+        if error:
+            return await self._reply(ctx, f"❌ {error}", True)
+        count = ai_store.clear_warnings(ctx.guild.id, member.id)
+        ranks.log_action(ctx.author.id, str(ctx.author), "clear_warnings", f"guild={ctx.guild.id} member={member.id} count={count}")
+        await self._reply(ctx, f"تم مسح {count} تحذيرًا لـ{member.mention}.", True)
+
     @member.command(name="timeout", description="تقييد عضو")
     @app_commands.describe(member="العضو", minutes="الدقائق")
     @need("moderate_members")
@@ -306,6 +469,7 @@ class Control(commands.Cog):
             return await self._reply(ctx, f"❌ {error}", True)
         await member.timeout(discord.utils.utcnow() + __import__('datetime').timedelta(minutes=max(1, min(40320, minutes))), reason=f"Vixen by {ctx.author}")
         logger.info("member_timeout actor=%s target=%s minutes=%s", ctx.author.id, member.id, minutes)
+        self._audit(ctx, "member_timeout", f"guild={ctx.guild.id} member={member.id} minutes={max(1, min(40320, minutes))}")
         await self._reply(ctx, "⏳ تم.")
 
     @member.command(name="untimeout", description="إزالة التقييد")
@@ -316,6 +480,7 @@ class Control(commands.Cog):
             return await self._reply(ctx, f"❌ {error}", True)
         await member.timeout(None, reason=f"Vixen by {ctx.author}")
         logger.info("member_untimeout actor=%s target=%s", ctx.author.id, member.id)
+        self._audit(ctx, "member_untimeout", f"guild={ctx.guild.id} member={member.id}")
         await self._reply(ctx, "✅ تم.")
 
     @member.command(name="kick", description="طرد عضو")
@@ -328,6 +493,7 @@ class Control(commands.Cog):
             return await self._reply(ctx, f"❌ {error}", True)
         await member.kick(reason=str(reason)[:512])
         logger.info("member_kick actor=%s target=%s", ctx.author.id, member.id)
+        self._audit(ctx, "member_kick", f"guild={ctx.guild.id} member={member.id} reason={str(reason)[:400]}")
         await self._reply(ctx, "👢 تم الطرد.")
 
     @member.command(name="ban", description="حظر عضو")
@@ -340,6 +506,7 @@ class Control(commands.Cog):
             return await self._reply(ctx, f"❌ {error}", True)
         await ctx.guild.ban(member, reason=str(reason)[:512], delete_message_seconds=0)
         logger.info("member_ban actor=%s target=%s", ctx.author.id, member.id)
+        self._audit(ctx, "member_ban", f"guild={ctx.guild.id} member={member.id} reason={str(reason)[:400]}")
         await self._reply(ctx, "🔨 تم الحظر.")
 
     @member.command(name="unban", description="فك حظر بواسطة ID")

@@ -46,6 +46,13 @@ let members = [];
 let memberAfter = '';
 let memberTimer;
 let currentPage = 'overview';
+let dmGuilds = [];
+let dmMembers = [];
+let dmTemplates = [];
+let currentDmTemplateId = '';
+let dmMemberTimer;
+let dmPreviewTimer;
+let terminalAbortController = null;
 
 function toast(message, kind = 'success') {
   const node = document.createElement('div');
@@ -80,16 +87,22 @@ function page(id) {
   const titles = {
     overview: 'نظرة عامة', commands: 'مركز الأوامر', members: 'الأعضاء والرسائل',
     security: 'الأمان والإشراف', economy: 'الاقتصاد', staff: 'الفريق والصلاحيات',
-    atria: 'Atria AI', logs: 'سجل التدقيق', settings: 'الإعدادات'
+    atria: 'AI Moderation', 'ai-chat': 'AI Chat', voice: 'Voice Control', 'dm-center': 'DM Center', 'bot-profile': 'Bot Profile', terminal: 'Live Terminal', logs: 'سجل التدقيق', settings: 'الإعدادات'
   };
   $('#title').textContent = titles[id] || id;
   $('#app').classList.remove('menu-open');
+  if (id !== 'terminal') stopTerminal();
   if (id === 'overview') stats();
   if (id === 'commands') renderCommands();
   if (id === 'members') loadMembers(true);
   if (id === 'economy') loadMarket();
-  if (id === 'staff') loadStaff();
+  if (id === 'staff') { loadStaff(); loadStaffWarnings(); }
   if (id === 'atria') loadAtria();
+  if (id === 'ai-chat') loadAIChat();
+  if (id === 'voice') loadVoice();
+  if (id === 'dm-center') loadDMCenter();
+  if (id === 'bot-profile') loadBotProfile();
+  if (id === 'terminal') startTerminal();
   if (id === 'logs') loadLogs();
   if (id === 'settings') loadSettings();
 }
@@ -407,6 +420,21 @@ async function loadStaff() {
   } catch (error) { toast(error.message, 'error'); }
 }
 $('#refreshStaff').onclick = loadStaff;
+let staffWarningTimer;
+$('#staffWarningSearch').oninput = () => {
+  clearTimeout(staffWarningTimer);
+  staffWarningTimer = setTimeout(loadStaffWarnings, 250);
+};
+$('#refreshStaffWarnings').onclick = loadStaffWarnings;
+async function loadStaffWarnings() {
+  try {
+    const query = encodeURIComponent($('#staffWarningSearch').value || '');
+    const data = await API.get(`/api/moderation/warnings?limit=100&q=${query}`);
+    $('#staffWarnings').innerHTML = (data.warnings || []).map(warning => `<tr><td>${esc(warning.member_name)} · ${esc(warning.user_id)}</td><td>${esc(warning.moderator_name)} · ${esc(warning.moderator_id)}</td><td>${esc(warning.reason)}</td><td>${date(warning.timestamp)}</td></tr>`).join('') || '<tr><td colspan="4" class="empty-cell">لا توجد تحذيرات محفوظة.</td></tr>';
+  } catch (error) {
+    $('#staffWarnings').innerHTML = `<tr><td colspan="4" class="empty-cell error-text">${esc(error.message)}</td></tr>`;
+  }
+}
 $('#generateCode').onclick = async () => {
   try {
     const data = await API.post('/api/staff/code', {rank: $('#codeRank').value, count: Number($('#codeCount').value || 1), note: $('#codeNote').value.trim()});
@@ -434,6 +462,16 @@ async function loadLogs() {
 }
 $('#refreshLogs').onclick = loadLogs;
 
+async function loadAIModerationLogs() {
+  try {
+    const data = await API.get('/api/ai/moderation/logs?limit=100');
+    $('#aiModLogs').innerHTML = (data.logs || []).map(log => `<tr><td>${date(log.timestamp)}</td><td>${esc(log.user_id)}</td><td>${esc(log.classification)}${log.confidence == null ? '' : ` · ${Math.round(Number(log.confidence) * 100)}%`}</td><td>${esc(log.action_requested || '—')}</td><td>${esc(log.result)}</td><td>${esc(log.reason)}</td></tr>`).join('') || '<tr><td colspan="6" class="empty-cell">لا توجد قرارات محفوظة.</td></tr>';
+  } catch (error) {
+    $('#aiModLogs').innerHTML = `<tr><td colspan="6" class="empty-cell error-text">${esc(error.message)}</td></tr>`;
+  }
+}
+$('#refreshAiLogs').onclick = loadAIModerationLogs;
+
 async function loadSettings() {
   try {
     const data = await API.get('/api/settings');
@@ -451,12 +489,42 @@ $('#saveSettings').onclick = async () => {
 
 async function loadAtria() {
   try {
-    const data = await API.get('/api/settings');
-    const atria = data.settings?.atria || {};
-    $('#aiModEnabled').checked = Boolean(atria.moderation_enabled);
-    $('#aiModMode').value = atria.moderation_mode || (atria.moderation_prefixes?.length ? 'prefix' : 'all');
-    $('#aiTimeout').value = atria.timeout_minutes || 10;
+    const data = await API.get('/api/ai/moderation/settings');
+    const moderation = data.config || {};
+    const legacy = data.legacy || {};
+    const channels = (data.guilds || []).flatMap(guild => (guild.channels || []).map(channel =>
+      `<option value="${esc(channel.id)}">${esc(guild.name)} · #${esc(channel.name)}</option>`
+    )).join('');
+    $('#aiModChannels').innerHTML = channels || '<option disabled>لا توجد قنوات نصية متاحة</option>';
+    const allowedChannels = new Set((moderation.channels || []).map(String));
+    $$('option', $('#aiModChannels')).forEach(option => { option.selected = allowedChannels.has(option.value); });
+    const detections = new Set((moderation.detection_types || ['spam', 'flood', 'repeated_messages', 'toxicity', 'harassment']).map(String));
+    $$('option', $('#aiModDetections')).forEach(option => { option.selected = detections.has(option.value); });
+    const actions = new Set((moderation.automatic_actions || []).map(String));
+    $('#aiModEnabled').checked = Boolean(moderation.enabled ?? legacy.moderation_enabled) && !moderation.kill_switch;
+    $('#aiModSensitivity').value = moderation.sensitivity || 'medium';
+    $('#aiModMaxActions').value = moderation.max_actions_per_hour || 20;
+    $('#aiTimeout').value = moderation.timeout_minutes || legacy.timeout_minutes || 10;
+    $('#aiActionWarn').checked = actions.has('warn');
+    $('#aiActionTimeout').checked = actions.has('timeout');
+    $('#aiActionBan').checked = actions.has('ban');
+    $('#aiAllowBan').checked = moderation.allow_ai_ban === true;
+    await Promise.all([loadAIStatus(), loadAIModerationLogs()]);
   } catch (error) { setResult('#aiSaveOut', error.message, 'error'); }
+}
+async function loadAIStatus() {
+  try {
+    const data = await API.get('/api/ai/status');
+    const provider = data.provider || {};
+    $('#aiProviderStatus').textContent = `${provider.provider || 'AI'} · ${provider.status || 'Unknown'}`;
+    const details = [provider.model, provider.latency_ms == null ? null : `${provider.latency_ms} ms`, provider.last_request, provider.error]
+      .filter(Boolean).join(' · ');
+    $('#aiProviderDetails').textContent = details || 'لم يُجر اتصال بالمزود بعد.';
+    $('#aiProviderDetails').classList.toggle('error', provider.status === 'Error' || provider.status === 'Not Configured');
+  } catch (error) {
+    $('#aiProviderStatus').textContent = 'Unavailable';
+    setResult('#aiProviderDetails', error.message, 'error');
+  }
 }
 async function runAtria(mode) {
   const prompt = $('#aiPrompt').value.trim();
@@ -465,17 +533,528 @@ async function runAtria(mode) {
   try { const data = await API.post('/api/atria', {prompt, mode}); $('#aiOut').textContent = data.answer || 'لم تصل نتيجة.'; }
   catch (error) { $('#aiOut').textContent = `❌ ${error.message}`; }
 }
-$('#aiSend').onclick = () => runAtria('chat');
 $('#aiModerate').onclick = () => runAtria('moderation');
-$('#saveAi').onclick = async () => {
+$('#aiTestProvider').onclick = async () => {
+  const button = $('#aiTestProvider');
+  button.disabled = true;
   try {
-    const data = await API.get('/api/settings');
-    const settings = data.settings || {};
-    settings.atria = {...(settings.atria || {}), moderation_enabled: $('#aiModEnabled').checked, moderation_mode: $('#aiModMode').value, timeout_minutes: Math.max(1, Math.min(60, Number($('#aiTimeout').value) || 10))};
-    await API.post('/api/settings', {settings});
+    await API.post('/api/ai/test', {});
+    await loadAIStatus();
+  } catch (error) {
+    setResult('#aiProviderDetails', error.message, 'error');
+  } finally { button.disabled = false; }
+};
+$('#aiKill').onclick = async () => {
+  const button = $('#aiKill');
+  button.disabled = true;
+  try {
+    await API.post('/api/ai/moderation/kill', {});
+    $('#aiModEnabled').checked = false;
+    setResult('#aiSaveOut', 'تم تعطيل AI Moderation فورًا.');
+    toast('تم تفعيل مفتاح إيقاف AI Moderation');
+    await loadAIStatus();
+  } catch (error) { setResult('#aiSaveOut', error.message, 'error'); }
+  finally { button.disabled = false; }
+};
+$('#saveAi').onclick = async () => {
+  const automatic_actions = [
+    $('#aiActionWarn').checked ? 'warn' : null,
+    $('#aiActionTimeout').checked ? 'timeout' : null,
+    $('#aiActionBan').checked ? 'ban' : null
+  ].filter(Boolean);
+  try {
+    await API.post('/api/ai/moderation/settings', {
+      enabled: $('#aiModEnabled').checked,
+      channels: selectedValues('#aiModChannels'),
+      detection_types: selectedValues('#aiModDetections'),
+      sensitivity: $('#aiModSensitivity').value,
+      automatic_actions,
+      allow_ai_ban: $('#aiAllowBan').checked,
+      max_actions_per_hour: Number($('#aiModMaxActions').value),
+      timeout_minutes: Number($('#aiTimeout').value)
+    });
     setResult('#aiSaveOut', 'تم حفظ إعدادات المراقبة.');
-    toast('تم حفظ إعدادات Atria');
+    toast('تم حفظ AI Moderation policy');
+    await Promise.all([loadAIStatus(), loadAIModerationLogs()]);
   } catch (error) { setResult('#aiSaveOut', error.message, 'error'); }
 };
+
+function selectedValues(selector) {
+  return $$('option:checked', $(selector)).map(option => option.value);
+}
+let voiceGuilds = [];
+async function loadVoice() {
+  try {
+    const data = await API.get('/api/voice/targets');
+    voiceGuilds = data.guilds || [];
+    $('#voiceGuild').innerHTML = voiceGuilds.map(guild => `<option value="${esc(guild.id)}">${esc(guild.name)}</option>`).join('') || '<option value="">No connected servers</option>';
+    renderVoiceChannels();
+    const current = voiceGuilds.find(guild => guild.id === $('#voiceGuild').value);
+    $('#voiceStatus').textContent = current?.connected_channel_id
+      ? `Connected · ${current.channels.find(channel => channel.id === current.connected_channel_id)?.name || current.connected_channel_id}`
+      : 'Disconnected';
+  } catch (error) { setResult('#voiceStatus', error.message, 'error'); }
+}
+function renderVoiceChannels() {
+  const guild = voiceGuilds.find(item => item.id === $('#voiceGuild').value);
+  const channels = guild?.channels || [];
+  $('#voiceChannel').innerHTML = channels.map(channel => `<option value="${esc(channel.id)}">${esc(channel.name)}</option>`).join('') || '<option value="">No voice channels</option>';
+}
+$('#voiceGuild').onchange = renderVoiceChannels;
+$('#refreshVoice').onclick = loadVoice;
+async function voiceAction(action) {
+  const guild_id = $('#voiceGuild').value;
+  const channel_id = $('#voiceChannel').value;
+  if (!guild_id) return setResult('#voiceStatus', 'لا يوجد سيرفر متاح.', 'error');
+  try {
+    const data = await API.post('/api/voice/action', {action, guild_id, channel_id});
+    setResult('#voiceStatus', `${action === 'join' ? 'Connected' : 'Disconnected'}${data.channel_name ? ` · ${data.channel_name}` : ''}`);
+    await loadVoice();
+  } catch (error) { setResult('#voiceStatus', error.message, 'error'); }
+}
+$('#voiceJoin').onclick = () => voiceAction('join');
+$('#voiceLeave').onclick = () => voiceAction('leave');
+async function loadAIChat() {
+  try {
+    const data = await API.get('/api/ai/chat/settings');
+    const config = data.config || {};
+    const options = (data.guilds || []).flatMap(guild => (guild.channels || []).map(channel =>
+      `<option value="${esc(channel.id)}" data-guild="${esc(guild.name)}">${esc(guild.name)} · #${esc(channel.name)}</option>`
+    )).join('');
+    $('#aiChatChannels').innerHTML = options || '<option disabled>لا توجد قنوات نصية متاحة</option>';
+    $('#aiChatIgnored').innerHTML = options || '<option disabled>لا توجد قنوات نصية متاحة</option>';
+    const allowed = new Set((config.allowed_channels || []).map(String));
+    const ignored = new Set((config.ignored_channels || []).map(String));
+    $$('option', $('#aiChatChannels')).forEach(option => { option.selected = allowed.has(option.value); });
+    $$('option', $('#aiChatIgnored')).forEach(option => { option.selected = ignored.has(option.value); });
+    const logChannels = (data.guilds || []).flatMap(guild => (guild.channels || [])
+      .filter(channel => allowed.has(String(channel.id)))
+      .map(channel => `<option value="${esc(channel.id)}">${esc(guild.name)} · #${esc(channel.name)}</option>`));
+    $('#aiChatLogChannel').innerHTML = logChannels.join('') || '<option value="">لا توجد قناة مسموحة</option>';
+    $('#aiChatEnabled').checked = Boolean(config.enabled);
+    $('#aiChatMode').value = config.response_mode || 'mention_only';
+    $('#aiChatLanguage').value = config.language || 'auto';
+    $('#aiChatContext').value = String(config.context_messages || 10);
+    $('#aiChatRetention').value = config.retention_days || 30;
+    $('#aiChatTunisian').checked = Boolean(config.tunisian_mode);
+    $('#aiChatName').value = config.name || 'Vixen';
+    $('#aiChatTone').value = config.tone || 'friendly';
+    $('#aiChatStyle').value = config.style || 'conversational';
+    $('#aiChatPrompt').value = config.system_prompt || '';
+    $('#aiChatUserCooldown').value = config.user_cooldown_seconds ?? 5;
+    $('#aiChatChannelCooldown').value = config.channel_cooldown_seconds ?? 2;
+    $('#aiChatGlobalCooldown').value = config.global_cooldown_seconds ?? 1;
+    if (logChannels.length) await loadAIChatLogs();
+    else $('#aiChatLogs').innerHTML = '<tr><td colspan="3" class="empty-cell">لا توجد قنوات AI Chat مسموحة.</td></tr>';
+  } catch (error) { setResult('#aiChatSaveResult', error.message, 'error'); }
+}
+$('#saveAIChat').onclick = async () => {
+  const payload = {
+    enabled: $('#aiChatEnabled').checked,
+    allowed_channels: selectedValues('#aiChatChannels'),
+    ignored_channels: selectedValues('#aiChatIgnored'),
+    response_mode: $('#aiChatMode').value,
+    language: $('#aiChatLanguage').value,
+    context_messages: Number($('#aiChatContext').value),
+    retention_days: Number($('#aiChatRetention').value),
+    tunisian_mode: $('#aiChatTunisian').checked,
+    name: $('#aiChatName').value.trim(),
+    tone: $('#aiChatTone').value.trim(),
+    style: $('#aiChatStyle').value.trim(),
+    system_prompt: $('#aiChatPrompt').value,
+    user_cooldown_seconds: Number($('#aiChatUserCooldown').value),
+    channel_cooldown_seconds: Number($('#aiChatChannelCooldown').value),
+    global_cooldown_seconds: Number($('#aiChatGlobalCooldown').value)
+  };
+  try {
+    await API.post('/api/ai/chat/settings', payload);
+    setResult('#aiChatSaveResult', 'تم حفظ إعدادات AI Chat.');
+    toast('تم حفظ إعدادات AI Chat');
+  } catch (error) { setResult('#aiChatSaveResult', error.message, 'error'); }
+};
+async function loadAIChatLogs() {
+  const channelId = $('#aiChatLogChannel').value;
+  if (!channelId) return;
+  try {
+    const data = await API.get(`/api/ai/chat/logs?channel_id=${encodeURIComponent(channelId)}&limit=100`);
+    $('#aiChatLogs').innerHTML = (data.messages || []).map(message => `<tr><td>${date(message.timestamp)}</td><td>${message.role === 'assistant' ? 'Vixen' : esc(message.user_id)}</td><td class="dm-log-content">${esc(message.content)}</td></tr>`).join('') || '<tr><td colspan="3" class="empty-cell">لا توجد محادثات محفوظة.</td></tr>';
+  } catch (error) { $('#aiChatLogs').innerHTML = `<tr><td colspan="3" class="empty-cell error-text">${esc(error.message)}</td></tr>`; }
+}
+$('#aiChatLogChannel').onchange = loadAIChatLogs;
+$('#refreshAIChatLogs').onclick = loadAIChatLogs;
+$('#testAIChat').onclick = async () => {
+  const prompt = $('#aiChatTestPrompt').value.trim();
+  if (!prompt) return setResult('#aiChatTestResult', 'اكتب رسالة للاختبار.', 'error');
+  $('#testAIChat').disabled = true;
+  $('#aiChatTestResult').textContent = 'جارٍ الاتصال بالمزود…';
+  try {
+    const data = await API.post('/api/ai/chat/test', {prompt});
+    $('#aiChatTestResult').textContent = data.answer || '';
+  } catch (error) { setResult('#aiChatTestResult', error.message, 'error'); }
+  finally { $('#testAIChat').disabled = false; }
+};
+
+function buildDMDesign() {
+  const fields = $$('.dm-field-row', $('#dmFields')).map(row => ({
+    name: $('.dm-field-name', row).value.trim(),
+    value: $('.dm-field-value', row).value.trim(),
+    inline: $('.dm-field-inline', row).checked
+  })).filter(field => field.name || field.value);
+  const authorName = $('#dmAuthor').value.trim();
+  const author = authorName ? {name: authorName} : null;
+  if (author && $('#dmAuthorUrl').value.trim()) author.url = $('#dmAuthorUrl').value.trim();
+  if (author && $('#dmAuthorIcon').value.trim()) author.icon_url = $('#dmAuthorIcon').value.trim();
+  const design = {
+    title: $('#dmTitle').value.trim(),
+    description: $('#dmDescription').value.trim(),
+    color: $('#dmColor').value,
+    thumbnail: $('#dmThumbnail').value.trim(),
+    image: $('#dmImage').value.trim(),
+    fields,
+    footer: $('#dmFooterIcon').value.trim()
+      ? {text: $('#dmFooter').value.trim(), icon_url: $('#dmFooterIcon').value.trim()}
+      : $('#dmFooter').value.trim(),
+    timestamp: $('#dmTimestamp').checked
+  };
+  if (author) design.author = author;
+  return design;
+}
+
+function addDMField(field = {}) {
+  const row = document.createElement('div');
+  row.className = 'dm-field-row form-grid';
+  row.innerHTML = `<label>Field name<input class="dm-field-name" maxlength="256" value="${esc(field.name || '')}"></label><label>Field value<textarea class="dm-field-value" maxlength="1024">${esc(field.value || '')}</textarea></label><label class="dm-inline-option"><input class="dm-field-inline" type="checkbox" ${field.inline ? 'checked' : ''}> Inline</label><button type="button" class="icon-button" data-dm-remove-field aria-label="Remove field">×</button>`;
+  $('#dmFields').appendChild(row);
+}
+
+function applyDMDesign(design = {}) {
+  $('#dmTitle').value = design.title || '';
+  $('#dmDescription').value = design.description || '';
+  $('#dmColor').value = /^#[0-9a-fA-F]{6}$/.test(design.color || '') ? design.color : '#f5a623';
+  const author = design.author || {};
+  $('#dmAuthor').value = author.name || '';
+  $('#dmAuthorUrl').value = author.url || '';
+  $('#dmAuthorIcon').value = author.icon_url || '';
+  $('#dmThumbnail').value = design.thumbnail?.url || design.thumbnail || '';
+  $('#dmImage').value = design.image?.url || design.image || '';
+  $('#dmFooter').value = design.footer?.text || design.footer || '';
+  $('#dmFooterIcon').value = design.footer?.icon_url || '';
+  $('#dmTimestamp').checked = Boolean(design.timestamp);
+  $('#dmFields').replaceChildren();
+  (design.fields || []).forEach(field => addDMField(field));
+  scheduleDMPreview();
+}
+
+function scheduleDMPreview() {
+  clearTimeout(dmPreviewTimer);
+  dmPreviewTimer = setTimeout(renderDMPreview, 450);
+}
+
+async function loadDMCenter() {
+  try {
+    const data = await API.get('/api/dm/center');
+    const previousGuild = $('#dmGuild').value;
+    dmGuilds = data.guilds || [];
+    $('#dmGuild').innerHTML = dmGuilds.map(guild => `<option value="${esc(guild.id)}">${esc(guild.name)} · ${number(guild.member_count)}</option>`).join('') || '<option value="">No connected servers</option>';
+    if (dmGuilds.some(guild => guild.id === previousGuild)) $('#dmGuild').value = previousGuild;
+    await Promise.all([loadDMTemplates(), loadDMHistory()]);
+    if ($('#dmMemberSearch').value.trim().length >= 2) await loadDMMembers();
+  } catch (error) { setResult('#dmCenterResult', error.message, 'error'); }
+}
+
+async function loadDMMembers() {
+  const guildId = $('#dmGuild').value;
+  const query = $('#dmMemberSearch').value.trim();
+  if (!guildId || query.length < 2) {
+    $('#dmMemberResults').innerHTML = '<div class="empty-state">اكتب حرفين على الأقل للبحث.</div>';
+    return;
+  }
+  try {
+    const data = await API.get(`/api/dm/members?guild_id=${encodeURIComponent(guildId)}&q=${encodeURIComponent(query)}`);
+    dmMembers = data.members || [];
+    $('#dmMemberResults').innerHTML = dmMembers.map(member => `<button type="button" class="member-row dm-member-choice" data-dm-center-member="${esc(member.id)}"><span class="member-main"><img class="avatar small" src="${esc(member.avatar)}" alt=""><span><b>${esc(member.display_name)}</b><small>${esc(member.username)} · ${esc(member.id)} · ${esc(member.roles.join(', ') || (member.is_bot ? 'Bot' : 'User'))}</small></span></span></button>`).join('') || '<div class="empty-state">لا يوجد عضو مطابق.</div>';
+  } catch (error) { $('#dmMemberResults').innerHTML = `<div class="empty-state error-text">${esc(error.message)}</div>`; }
+}
+
+async function loadDMTemplates() {
+  const guildId = $('#dmGuild').value;
+  if (!guildId) return;
+  const data = await API.get(`/api/dm/templates?guild_id=${encodeURIComponent(guildId)}`);
+  dmTemplates = data.templates || [];
+  $('#dmTemplate').innerHTML = `<option value="">تصميم جديد</option>${dmTemplates.map(template => `<option value="${esc(template.template_id)}">${esc(template.name)}</option>`).join('')}`;
+  if (dmTemplates.some(template => String(template.template_id) === String(currentDmTemplateId))) {
+    $('#dmTemplate').value = String(currentDmTemplateId);
+  } else {
+    currentDmTemplateId = '';
+    $('#dmTemplate').value = '';
+  }
+}
+
+async function loadDMHistory() {
+  const guildId = $('#dmGuild').value;
+  if (!guildId) return;
+  try {
+    const data = await API.get(`/api/dm/history?guild_id=${encodeURIComponent(guildId)}&limit=100`);
+    $('#dmHistory').innerHTML = (data.history || []).map(item => `<tr><td>${esc(item.recipient_id)}</td><td>${item.template_id ? `#${esc(item.template_id)}` : 'Custom'}</td><td>${esc(item.sender_id)}</td><td><span class="status-tag ${esc(item.status)}">${esc(item.status)}</span></td><td>${esc(item.error || '—')}</td><td>${date(item.timestamp)}</td></tr>`).join('') || '<tr><td colspan="6" class="empty-cell">لا يوجد سجل إرسال.</td></tr>';
+  } catch (error) { $('#dmHistory').innerHTML = `<tr><td colspan="6" class="empty-cell error-text">${esc(error.message)}</td></tr>`; }
+}
+
+async function renderDMPreview() {
+  const guildId = $('#dmGuild').value;
+  const memberId = $('#dmRecipientId').value.trim();
+  if (!guildId || !/^\d+$/.test(memberId)) {
+    $('#dmPreview').textContent = 'اختر سيرفرًا وعضوًا لمعاينة المتغيرات.';
+    return null;
+  }
+  try {
+    const body = {guild_id: guildId, member_id: memberId, reason: $('#dmReason').value, embed: buildDMDesign()};
+    if (currentDmTemplateId) body.template_id = currentDmTemplateId;
+    const data = await API.post('/api/dm/preview', body);
+    const embed = data.embed;
+    const color = `#${Number(embed.color || 0xf5a623).toString(16).padStart(6, '0')}`;
+    const author = embed.author?.name ? `<b>${esc(embed.author.name)}</b><br>` : '';
+    const fields = (embed.fields || []).map(field => `<div class="dm-preview-field"><b>${esc(field.name)}</b><p>${esc(field.value)}</p></div>`).join('');
+    const image = embed.image?.url ? `<img class="dm-preview-image" src="${esc(embed.image.url)}" alt="">` : '';
+    const thumbnail = embed.thumbnail?.url ? `<img class="dm-preview-thumbnail" src="${esc(embed.thumbnail.url)}" alt="">` : '';
+    $('#dmPreview').innerHTML = `<div class="dm-preview-card" style="border-color:${esc(color)}">${author}${embed.title ? `<h3>${esc(embed.title)}</h3>` : ''}${embed.description ? `<p>${esc(embed.description)}</p>` : ''}${thumbnail}${fields}${image}${embed.footer?.text ? `<small>${esc(embed.footer.text)}</small>` : ''}</div>`;
+    return data;
+  } catch (error) {
+    setResult('#dmCenterResult', error.message, 'error');
+    $('#dmPreview').textContent = 'تعذر إنشاء المعاينة؛ راجع قيم Embed.';
+    return null;
+  }
+}
+
+$('#dmGuild').onchange = async () => {
+  currentDmTemplateId = '';
+  await Promise.all([loadDMTemplates(), loadDMHistory()]);
+  $('#dmMemberResults').innerHTML = '';
+  scheduleDMPreview();
+};
+$('#dmMemberSearch').oninput = () => {
+  clearTimeout(dmMemberTimer);
+  dmMemberTimer = setTimeout(loadDMMembers, 250);
+};
+document.addEventListener('click', event => {
+  const memberButton = event.target.closest('[data-dm-center-member]');
+  if (memberButton) {
+    const member = dmMembers.find(item => item.id === memberButton.dataset.dmCenterMember);
+    if (!member) return;
+    $('#dmRecipientId').value = member.id;
+    $('#dmSelectedMember').textContent = `${member.display_name} · ${member.username} · ${member.roles.join(', ') || (member.is_bot ? 'Bot' : 'User')}`;
+    scheduleDMPreview();
+  }
+  if (event.target.closest('[data-dm-remove-field]')) {
+    event.target.closest('.dm-field-row')?.remove();
+    scheduleDMPreview();
+  }
+});
+$('#dmTemplate').onchange = () => {
+  currentDmTemplateId = $('#dmTemplate').value;
+  const template = dmTemplates.find(item => String(item.template_id) === String(currentDmTemplateId));
+  if (template) {
+    $('#dmTemplateName').value = template.name;
+    applyDMDesign(template.embed);
+  } else {
+    $('#dmTemplateName').value = '';
+    applyDMDesign({});
+  }
+};
+$('#dmFields').addEventListener('input', scheduleDMPreview);
+$('#dm-center').addEventListener('input', scheduleDMPreview);
+$('#dm-center').addEventListener('change', scheduleDMPreview);
+$('#dmAddField').onclick = () => { addDMField(); scheduleDMPreview(); };
+$('#dmPreviewButton').onclick = renderDMPreview;
+$('#refreshDM').onclick = loadDMCenter;
+$('#refreshDMHistory').onclick = loadDMHistory;
+$('#dmInstallTemplates').onclick = async () => {
+  try {
+    const result = await API.post('/api/dm/templates', {guild_id: $('#dmGuild').value, action: 'install_defaults'});
+    await loadDMTemplates();
+    setResult('#dmCenterResult', `تمت إضافة ${result.created} قالبًا جاهزًا.`);
+  } catch (error) { setResult('#dmCenterResult', error.message, 'error'); }
+};
+$('#dmUseBranding').onclick = () => {
+  const guild = dmGuilds.find(item => item.id === $('#dmGuild').value);
+  if (!guild) return setResult('#dmCenterResult', 'اختر سيرفرًا أولًا.', 'error');
+  $('#dmAuthor').value = guild.name;
+  $('#dmAuthorIcon').value = guild.icon || '';
+  $('#dmColor').value = /^#[0-9a-fA-F]{6}$/.test(guild.primary_color || '') ? guild.primary_color : '#f5a623';
+  $('#dmFooter').value = '{server} · {timestamp}';
+  scheduleDMPreview();
+};
+$('#dmUseBotBranding').onclick = () => {
+  const guild = dmGuilds.find(item => item.id === $('#dmGuild').value);
+  if (!guild) return setResult('#dmCenterResult', 'اختر سيرفرًا أولًا.', 'error');
+  $('#dmAuthor').value = guild.bot_name || 'Vixen';
+  $('#dmAuthorIcon').value = guild.bot_avatar || '';
+  $('#dmColor').value = /^#[0-9a-fA-F]{6}$/.test(guild.accent_color || '') ? guild.accent_color : '#2ecc71';
+  scheduleDMPreview();
+};
+$('#dmSaveTemplate').onclick = async () => {
+  const name = $('#dmTemplateName').value.trim();
+  try {
+    const payload = {guild_id: $('#dmGuild').value, action: 'save', name, embed: buildDMDesign()};
+    if (currentDmTemplateId) payload.template_id = currentDmTemplateId;
+    const result = await API.post('/api/dm/templates', payload);
+    currentDmTemplateId = String(result.template_id);
+    await loadDMTemplates();
+    $('#dmTemplate').value = currentDmTemplateId;
+    setResult('#dmCenterResult', 'تم حفظ القالب.');
+    await loadDMHistory();
+  } catch (error) { setResult('#dmCenterResult', error.message, 'error'); }
+};
+$('#dmDuplicateTemplate').onclick = async () => {
+  if (!currentDmTemplateId) return setResult('#dmCenterResult', 'اختر قالبًا لنسخه.', 'error');
+  const name = `${$('#dmTemplateName').value.trim()} copy`.trim();
+  try {
+    const result = await API.post('/api/dm/templates', {guild_id: $('#dmGuild').value, action: 'duplicate', template_id: currentDmTemplateId, name});
+    currentDmTemplateId = String(result.template_id);
+    await loadDMTemplates();
+    $('#dmTemplate').value = currentDmTemplateId;
+    $('#dmTemplateName').value = name;
+    toast('تم نسخ القالب');
+  } catch (error) { setResult('#dmCenterResult', error.message, 'error'); }
+};
+$('#dmDeleteTemplate').onclick = async () => {
+  if (!currentDmTemplateId) return setResult('#dmCenterResult', 'اختر قالبًا لحذفه.', 'error');
+  if (!confirm('حذف القالب المحدد؟')) return;
+  try {
+    await API.post('/api/dm/templates', {guild_id: $('#dmGuild').value, action: 'delete', template_id: currentDmTemplateId});
+    currentDmTemplateId = '';
+    $('#dmTemplateName').value = '';
+    applyDMDesign({});
+    await loadDMTemplates();
+    toast('تم حذف القالب');
+  } catch (error) { setResult('#dmCenterResult', error.message, 'error'); }
+};
+$('#dmSendButton').onclick = async () => {
+  const preview = await renderDMPreview();
+  if (!preview) return;
+  if (!confirm(`إرسال هذا الـEmbed إلى ${preview.recipient.name}؟`)) return;
+  const button = $('#dmSendButton');
+  button.disabled = true;
+  try {
+    const payload = {
+      guild_id: $('#dmGuild').value,
+      member_id: $('#dmRecipientId').value.trim(),
+      confirm: true,
+      preview_token: preview.preview_token
+    };
+    const result = await API.post('/api/dm/send', payload);
+    setResult('#dmCenterResult', `تم الإرسال فعليًا · سجل #${result.dm_id}`);
+    toast('تم إرسال DM');
+  } catch (error) { setResult('#dmCenterResult', error.message, 'error'); }
+  finally { button.disabled = false; await loadDMHistory(); }
+};
+
+function uptimeLabel(seconds) {
+  if (!Number.isFinite(Number(seconds))) return '—';
+  let remaining = Math.max(0, Math.floor(Number(seconds)));
+  const days = Math.floor(remaining / 86400); remaining %= 86400;
+  const hours = Math.floor(remaining / 3600); remaining %= 3600;
+  const minutes = Math.floor(remaining / 60); const secs = remaining % 60;
+  return `${days}d ${hours}h ${minutes}m ${secs}s`;
+}
+async function loadBotProfile() {
+  try {
+    const data = await API.get('/api/bot/profile');
+    $('#profileAvatar').src = data.avatar || '';
+    $('#profileAvatar').classList.toggle('hidden', !data.avatar);
+    $('#profileName').textContent = data.name || 'Bot not connected';
+    $('#profileUsername').textContent = data.display_name || '';
+    $('#profileId').textContent = data.id ? `ID ${data.id} · ${data.version}` : data.version;
+    $('#profileConnection').textContent = data.connected ? 'Connected' : 'Not connected';
+    $('#profileConnection').classList.toggle('success', Boolean(data.connected));
+    $('#profileLatency').textContent = data.latency_ms == null ? '—' : `${number(data.latency_ms)} ms`;
+    $('#profileUptime').textContent = uptimeLabel(data.uptime_seconds);
+    $('#profileGuilds').textContent = data.guilds == null ? '—' : number(data.guilds);
+    $('#profileMembers').textContent = data.members == null ? '—' : number(data.members);
+    $('#profileCommands').textContent = data.commands == null ? '—' : number(data.commands);
+    $('#profileAI').textContent = data.ai?.status || 'Unknown';
+    $('#presenceType').value = data.presence?.type || 'playing';
+    $('#presenceName').value = data.presence?.name || '';
+  } catch (error) { toast(error.message, 'error'); }
+}
+$('#refreshBotProfile').onclick = loadBotProfile;
+$('#savePresence').onclick = async () => {
+  const name = $('#presenceName').value.trim();
+  try {
+    const result = await API.post('/api/bot/presence', {type: $('#presenceType').value, name});
+    setResult('#presenceResult', result.applied ? 'Presence تطبقت على Discord.' : 'Presence محفوظة وستطبق عند اتصال Gateway.');
+    await loadBotProfile();
+  } catch (error) { setResult('#presenceResult', error.message, 'error'); }
+};
+
+function appendTerminalEvent(event) {
+  const line = document.createElement('div');
+  line.className = `terminal-line ${String(event.level || '').toLowerCase()}`;
+  const timestamp = event.timestamp ? new Date(event.timestamp).toLocaleTimeString() : '';
+  line.textContent = `[${timestamp}] [${event.level || 'INFO'}] ${event.logger || 'Vixen'} ${event.message || ''}`;
+  $('#terminalOutput').appendChild(line);
+  while ($('#terminalOutput').children.length > 300) $('#terminalOutput').firstElementChild.remove();
+  $('#terminalOutput').scrollTop = $('#terminalOutput').scrollHeight;
+}
+
+function stopTerminal() {
+  if (terminalAbortController) {
+    const controller = terminalAbortController;
+    terminalAbortController = null;
+    controller.abort();
+  }
+  const status = $('#terminalStatus');
+  if (status) status.textContent = 'Disconnected';
+  const button = $('#terminalToggle');
+  if (button) button.textContent = 'Start stream';
+}
+
+async function startTerminal() {
+  if (terminalAbortController) return stopTerminal();
+  const controller = new AbortController();
+  terminalAbortController = controller;
+  $('#terminalStatus').textContent = 'Connecting…';
+  $('#terminalStatus').classList.remove('error');
+  $('#terminalToggle').textContent = 'Stop stream';
+  try {
+    const response = await fetch('/api/terminal/stream', {
+      headers: {Authorization: `Bearer ${API.token}`},
+      signal: controller.signal
+    });
+    if (!response.ok) {
+      let body = {};
+      try { body = await response.json(); } catch (_) {}
+      throw Error(body.error || `HTTP ${response.status}`);
+    }
+    $('#terminalStatus').textContent = 'Connected';
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffered = '';
+    while (terminalAbortController === controller) {
+      const {value, done} = await reader.read();
+      if (done) break;
+      buffered += decoder.decode(value, {stream: true});
+      const blocks = buffered.split(/\r?\n\r?\n/);
+      buffered = blocks.pop() || '';
+      for (const block of blocks) {
+        const dataLine = block.split(/\r?\n/).find(line => line.startsWith('data:'));
+        if (!dataLine) continue;
+        try { appendTerminalEvent(JSON.parse(dataLine.slice(5).trim())); }
+        catch (_) { /* Ignore malformed event frames. */ }
+      }
+    }
+  } catch (error) {
+    if (error.name !== 'AbortError' && terminalAbortController === controller) {
+      $('#terminalStatus').textContent = error.message;
+      $('#terminalStatus').classList.add('error');
+    }
+  } finally {
+    if (terminalAbortController === controller) {
+      terminalAbortController = null;
+      $('#terminalToggle').textContent = 'Start stream';
+      if ($('#terminalStatus').textContent === 'Connected') $('#terminalStatus').textContent = 'Disconnected';
+    }
+  }
+}
+$('#terminalToggle').onclick = startTerminal;
 
 boot();

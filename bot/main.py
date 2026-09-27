@@ -10,6 +10,7 @@ import asyncio
 import os
 import sys
 import logging
+import time
 
 import discord
 from discord.ext import commands
@@ -40,6 +41,7 @@ intents.members = True
 intents.message_content = True
 
 bot = commands.Bot(command_prefix=PREFIX, intents=intents, help_command=None)
+bot._vixen_started_at = time.monotonic()
 
 COGS = [
     "bot.cogs.economy",
@@ -75,7 +77,20 @@ async def on_ready():
     except Exception as e:
         logger.error(f"فشل مزامنة الأوامر: {e}")
 
-    activity = discord.Game(name=f"{PREFIX}help | نظام العملات")
+    bot_settings = load_settings().get("bot", {})
+    presence = bot_settings.get("presence", {}) if isinstance(bot_settings, dict) else {}
+    presence_type = presence.get("type", "playing") if isinstance(presence, dict) else "playing"
+    presence_name = presence.get("name", f"{PREFIX}help | نظام العملات") if isinstance(presence, dict) else f"{PREFIX}help | نظام العملات"
+    activity_types = {
+        "playing": discord.ActivityType.playing,
+        "listening": discord.ActivityType.listening,
+        "watching": discord.ActivityType.watching,
+    }
+    if not isinstance(presence_type, str) or presence_type not in activity_types:
+        presence_type = "playing"
+    if not isinstance(presence_name, str) or not presence_name.strip():
+        presence_name = f"{PREFIX}help | نظام العملات"
+    activity = discord.Activity(type=activity_types.get(presence_type, discord.ActivityType.playing), name=presence_name)
     await bot.change_presence(activity=activity, status=discord.Status.online)
 
 

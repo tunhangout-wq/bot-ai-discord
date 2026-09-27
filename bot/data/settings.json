@@ -73,6 +73,10 @@
     "log_channel_id": "",
     "welcome_channel_id": ""
   },
+  "moderation": {
+    "warning_threshold": 10,
+    "warning_timeout_minutes": 60
+  },
   "leaderboard": {
     "show_top": 10
   },

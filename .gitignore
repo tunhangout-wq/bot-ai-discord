@@ -1,0 +1,4 @@
+.env
+bot/data/*.sqlite3
+bot/data/*.sqlite3-shm
+bot/data/*.sqlite3-wal

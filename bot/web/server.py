@@ -20,9 +20,11 @@ import os
 import time
 import secrets
 import logging
+import json
 import inspect
 import hashlib
 import math
+import sqlite3
 import types
 import typing
 import asyncio
@@ -39,8 +41,26 @@ from bot.utils.data_manager import (
 )
 from bot.utils import ranks
 from bot.cogs.atria import atria_chat
+from bot.services.ai_provider import ai_provider
+from bot.services.ai_chat import ai_chat_service
+from bot.utils.ai_store import ai_store
+from bot.utils.dm_store import dm_store
+from bot.services.dm_center import render_embed
+from bot.services.live_terminal import live_terminal, install_live_terminal
 
 logger = logging.getLogger("Vixen.Web")
+DM_PREVIEW_TOKENS = {}
+DM_PREVIEW_TTL = 300
+DM_STARTER_TEMPLATES = [
+    ("Welcome", {"title": "Welcome, {username}", "description": "Welcome to {server}.", "color": "#2ecc71", "footer": "Member {member_count} · {timestamp}", "timestamp": True}),
+    ("Warning", {"title": "Moderation notice", "description": "A warning was issued in {server}. Reason: {reason}", "color": "#f5a623", "footer": "Contact the moderation team if you need help."}),
+    ("Timeout", {"title": "Timeout notice", "description": "A timeout was applied in {server}. Reason: {reason}", "color": "#e74c3c", "footer": "{timestamp}", "timestamp": True}),
+    ("Announcement", {"title": "{server} announcement", "description": "{reason}", "color": "#3498db", "timestamp": True}),
+    ("Event", {"title": "Event update · {server}", "description": "{reason}", "color": "#9b59b6", "timestamp": True}),
+    ("Update", {"title": "Server update", "description": "{reason}", "color": "#1abc9c", "footer": "{server} · {timestamp}", "timestamp": True}),
+    ("Moderation Notice", {"title": "Moderation notice", "description": "{reason}", "color": "#e67e22", "footer": "{server}"}),
+    ("Staff Notice", {"title": "Staff notice · {server}", "description": "{reason}", "color": "#34495e", "timestamp": True}),
+]
 
 DASHBOARD_DIR = Path(__file__).resolve().parent.parent.parent / "dashboard"
 
@@ -362,6 +382,81 @@ async def api_stats(request: web.Request) -> web.Response:
         "bot": bot_info,
         "currency_symbol": settings.get("bot", {}).get("currency_symbol", "🪙"),
     })
+
+
+async def api_bot_profile(request: web.Request) -> web.Response:
+    require_permission(request, "view_stats")
+    bot = request.app.get("bot")
+    settings = load_settings()
+    bot_settings = settings.get("bot", {})
+    presence = bot_settings.get("presence", {}) if isinstance(bot_settings, dict) else {}
+    guilds = list(getattr(bot, "guilds", []))
+    user = getattr(bot, "user", None) if bot else None
+    latency = getattr(bot, "latency", float("nan")) if bot else float("nan")
+    latency_ms = round(latency * 1000) if math.isfinite(latency) else None
+    started = getattr(bot, "_vixen_started_at", None) if bot else None
+    uptime_seconds = max(0, int(time.monotonic() - started)) if started is not None else None
+    return _json_response({
+        "ok": True,
+        "connected": bool(user and bot.is_ready()),
+        "name": user.name if user else None,
+        "display_name": user.global_name if user else None,
+        "id": str(user.id) if user else None,
+        "avatar": user.display_avatar.url if user else None,
+        "latency_ms": latency_ms,
+        "uptime_seconds": uptime_seconds,
+        "guilds": len(guilds),
+        "members": sum(int(guild.member_count or len(guild.members)) for guild in guilds),
+        "commands": len(_all_commands(bot)),
+        "version": os.getenv("VIXEN_VERSION", "development"),
+        "ai": ai_provider.status(),
+        "presence": presence if isinstance(presence, dict) else {"type": "playing", "name": ""},
+    })
+
+
+async def api_bot_presence(request: web.Request) -> web.Response:
+    session = require_permission(request, "manage_settings")
+    try:
+        body = await request.json()
+    except Exception:
+        return _error("طلب غير صالح")
+    if not isinstance(body, dict):
+        return _error("طلب غير صالح")
+    activity_type = body.get("type")
+    name = body.get("name")
+    if activity_type not in {"playing", "listening", "watching"}:
+        return _error("نوع Presence غير صالح")
+    if not isinstance(name, str) or not name.strip() or len(name.strip()) > 128:
+        return _error("اكتب Presence لا يتجاوز 128 حرفًا")
+    presence = {"type": activity_type, "name": name.strip()}
+    settings = load_settings()
+    bot_settings = settings.setdefault("bot", {})
+    if not isinstance(bot_settings, dict):
+        bot_settings = {}
+        settings["bot"] = bot_settings
+    bot_settings["presence"] = presence
+    save_settings(settings)
+    applied = False
+    bot = request.app.get("bot")
+    if bot and bot.is_ready():
+        activity_types = {
+            "playing": discord.ActivityType.playing,
+            "listening": discord.ActivityType.listening,
+            "watching": discord.ActivityType.watching,
+        }
+        try:
+            await bot.change_presence(activity=discord.Activity(type=activity_types[activity_type], name=presence["name"]))
+            applied = True
+        except (discord.Forbidden, discord.HTTPException):
+            logger.exception("Could not apply bot Presence immediately")
+    ranks.log_action(
+        int(session.get("user_id") or 0),
+        session.get("name", "Dashboard"),
+        "bot_presence",
+        f"type={activity_type} name={presence['name']} applied={applied}",
+        "dashboard",
+    )
+    return _json_response({"ok": True, "presence": presence, "applied": applied})
 
 
 # ---------------------------------------------------------------------------
@@ -694,13 +789,9 @@ async def api_atria(request: web.Request) -> web.Response:
     mode = body.get("mode", "chat")
     if not isinstance(prompt, str) or not prompt.strip() or len(prompt) > 4000:
         return _error("اكتب نصاً صالحاً لا يتجاوز 4000 حرف.")
-    if mode not in {"chat", "moderation"}:
-        return _error("وضع Atria غير صالح.")
-    system = (
-        "You are Vixen Discord EDR assistant. Help with Discord administration, moderation, security and bot operations. Be concise and safe."
-        if mode == "chat" else
-        "You are a Discord safety moderator. Analyze the supplied text and return JSON only with action: allow, warn, timeout, or ban, plus a short reason. Do not invent facts."
-    )
+    if mode != "moderation":
+        return _error("استخدم مسار AI Chat المستقل للمحادثة.")
+    system = "You are a Discord safety moderator. Return JSON only with classification and short reason. Do not request or execute Discord actions in this manual analysis."
     try:
         answer = await atria_chat(
             [{"role": "system", "content": system}, {"role": "user", "content": prompt}],
@@ -710,6 +801,703 @@ async def api_atria(request: web.Request) -> web.Response:
     except (RuntimeError, ValueError):
         logger.exception("Dashboard Atria request failed")
         return _error("تعذر الوصول إلى خدمة Atria الآن.", 502)
+
+
+async def api_ai_status(request: web.Request) -> web.Response:
+    require_permission(request, "view_stats")
+    settings = load_settings()
+    ai_settings = settings.get("ai", {})
+    moderation = ai_settings.get("moderation", {}) if isinstance(ai_settings, dict) else {}
+    if not isinstance(moderation, dict):
+        moderation = {}
+    chat = ai_settings.get("chat", {}) if isinstance(ai_settings, dict) else {}
+    if not isinstance(chat, dict):
+        chat = {}
+    legacy_moderation = settings.get("atria", {})
+    if not isinstance(legacy_moderation, dict):
+        legacy_moderation = {}
+    return _json_response({
+        "ok": True,
+        "provider": ai_provider.status(),
+        "moderation_enabled": bool(moderation.get("enabled", legacy_moderation.get("moderation_enabled", False))),
+        "moderation_killed": bool(moderation.get("kill_switch", False)),
+        "chat_enabled": bool(chat.get("enabled", False)),
+    })
+
+
+async def api_ai_test(request: web.Request) -> web.Response:
+    require_permission(request, "manage_settings")
+    status = await ai_provider.test_connection()
+    return _json_response({"ok": True, "provider": status})
+
+
+async def api_ai_chat_settings(request: web.Request) -> web.Response:
+    session = require_permission(request, "manage_settings")
+    settings = load_settings()
+    ai_settings = settings.get("ai", {})
+    config = ai_settings.get("chat", {}) if isinstance(ai_settings, dict) else {}
+    if request.method == "GET":
+        bot = request.app.get("bot")
+        guilds = []
+        for guild in getattr(bot, "guilds", []):
+            guilds.append({
+                "id": str(guild.id),
+                "name": guild.name,
+                "channels": [
+                    {"id": str(channel.id), "name": channel.name}
+                    for channel in guild.text_channels
+                ],
+            })
+        return _json_response({
+            "ok": True,
+            "config": config if isinstance(config, dict) else {},
+            "guilds": guilds,
+        })
+
+    try:
+        body = await request.json()
+    except Exception:
+        return _error("طلب غير صالح")
+    if not isinstance(body, dict):
+        return _error("طلب غير صالح")
+    channel_ids = body.get("allowed_channels", [])
+    ignored_ids = body.get("ignored_channels", [])
+    if not isinstance(channel_ids, list) or not isinstance(ignored_ids, list):
+        return _error("قائمة القنوات غير صالحة")
+    if len(channel_ids) > 100 or len(ignored_ids) > 100:
+        return _error("عدد القنوات يتجاوز الحد")
+    bot = request.app.get("bot")
+    valid_channels = {
+        str(channel.id)
+        for guild in getattr(bot, "guilds", [])
+        for channel in guild.text_channels
+    }
+    normalized_channels = {str(value) for value in channel_ids if str(value).isdigit()}
+    normalized_ignored = {str(value) for value in ignored_ids if str(value).isdigit()}
+    if len(normalized_channels) != len(channel_ids) or len(normalized_ignored) != len(ignored_ids):
+        return _error("أحد معرّفات القنوات غير صالح")
+    if not normalized_channels.issubset(valid_channels) or not normalized_ignored.issubset(valid_channels):
+        return _error("القناة المحددة غير موجودة ضمن سيرفرات البوت")
+    mode = body.get("response_mode", "mention_only")
+    if mode not in {"mention_only", "every_message", "commands_only"}:
+        return _error("وضع الرد غير صالح")
+    language = body.get("language", "auto")
+    if language not in {"auto", "tunisian", "arabic", "french", "english"}:
+        return _error("اللغة غير صالحة")
+    try:
+        context_messages = int(body.get("context_messages", 10))
+        retention_days = max(1, min(3650, int(body.get("retention_days", 30))))
+        cooldowns = {
+            "user_cooldown_seconds": max(0, min(3600, int(body.get("user_cooldown_seconds", 5)))),
+            "channel_cooldown_seconds": max(0, min(3600, int(body.get("channel_cooldown_seconds", 2)))),
+            "global_cooldown_seconds": max(0, min(3600, int(body.get("global_cooldown_seconds", 1)))),
+        }
+    except (TypeError, ValueError, OverflowError):
+        return _error("إعدادات السياق أو التهدئة غير صالحة")
+    if context_messages not in {10, 20, 50}:
+        return _error("السياق يجب أن يكون 10 أو 20 أو 50 رسالة")
+    enabled = body.get("enabled", False)
+    tunisian_mode = body.get("tunisian_mode", False)
+    if not isinstance(enabled, bool) or not isinstance(tunisian_mode, bool):
+        return _error("حالة التفعيل غير صالحة")
+    if enabled and not normalized_channels:
+        return _error("اختر قناة مسموحة واحدة على الأقل قبل التفعيل")
+    config = {
+        "enabled": enabled,
+        "allowed_channels": sorted(normalized_channels),
+        "ignored_channels": sorted(normalized_ignored),
+        "response_mode": mode,
+        "language": language,
+        "tunisian_mode": tunisian_mode,
+        "context_messages": context_messages,
+        "retention_days": retention_days,
+        "name": str(body.get("name", "Vixen"))[:80],
+        "tone": str(body.get("tone", "friendly"))[:80],
+        "style": str(body.get("style", "conversational"))[:120],
+        "system_prompt": str(body.get("system_prompt", ""))[:2000],
+        **cooldowns,
+    }
+    if not isinstance(ai_settings, dict):
+        ai_settings = {}
+    ai_settings["chat"] = config
+    settings["ai"] = ai_settings
+    save_settings(settings)
+    ranks.log_action(
+        int(session.get("user_id") or 0),
+        session.get("name", "Dashboard"),
+        "ai_chat_settings",
+        f"enabled={enabled} channels={len(normalized_channels)} mode={mode}",
+        "dashboard",
+    )
+    return _json_response({"ok": True, "config": config})
+
+
+async def api_ai_moderation_settings(request: web.Request) -> web.Response:
+    session = require_permission(request, "manage_settings")
+    settings = load_settings()
+    ai_settings = settings.get("ai", {})
+    config = ai_settings.get("moderation", {}) if isinstance(ai_settings, dict) else {}
+    legacy = settings.get("atria", {})
+    if request.method == "GET":
+        bot = request.app.get("bot")
+        guilds = [{
+            "id": str(guild.id),
+            "name": guild.name,
+            "channels": [{"id": str(channel.id), "name": channel.name} for channel in guild.text_channels],
+        } for guild in getattr(bot, "guilds", [])]
+        return _json_response({
+            "ok": True,
+            "config": config if isinstance(config, dict) else {},
+            "legacy": legacy if isinstance(legacy, dict) else {},
+            "guilds": guilds,
+        })
+
+    try:
+        body = await request.json()
+    except Exception:
+        return _error("طلب غير صالح")
+    if not isinstance(body, dict):
+        return _error("طلب غير صالح")
+    channel_ids = body.get("channels", [])
+    actions = body.get("automatic_actions", [])
+    detections = body.get("detection_types", [])
+    if not all(isinstance(value, list) for value in (channel_ids, actions, detections)):
+        return _error("قوائم سياسة AI غير صالحة")
+    if len(channel_ids) > 100:
+        return _error("عدد القنوات يتجاوز الحد")
+    valid_channels = {
+        str(channel.id)
+        for guild in getattr(request.app.get("bot"), "guilds", [])
+        for channel in guild.text_channels
+    }
+    normalized_channels = {str(value) for value in channel_ids if str(value).isdigit()}
+    if len(normalized_channels) != len(channel_ids) or not normalized_channels.issubset(valid_channels):
+        return _error("القناة المحددة غير موجودة ضمن سيرفرات البوت")
+    if any(action not in {"warn", "timeout", "ban"} for action in actions):
+        return _error("إجراء تلقائي غير مدعوم")
+    allowed_detections = {
+        "spam", "flood", "repeated_messages", "toxicity", "harassment", "suspicious", "raid_like"
+    }
+    if any(detection not in allowed_detections for detection in detections):
+        return _error("نوع اكتشاف غير مدعوم")
+    sensitivity = body.get("sensitivity", "medium")
+    if sensitivity not in {"low", "medium", "high"}:
+        return _error("مستوى الحساسية غير صالح")
+    enabled = body.get("enabled", False)
+    allow_ai_ban = body.get("allow_ai_ban", False)
+    if not isinstance(enabled, bool) or not isinstance(allow_ai_ban, bool):
+        return _error("حالة التفعيل غير صالحة")
+    if enabled and (not normalized_channels or not detections):
+        return _error("اختر قناة ونوع اكتشاف واحدًا على الأقل قبل التفعيل")
+    if allow_ai_ban and "ban" not in actions:
+        return _error("أضف ban إلى الإجراءات التلقائية قبل تفعيل السماح به")
+    try:
+        max_actions = max(1, min(1000, int(body.get("max_actions_per_hour", 20))))
+        timeout_minutes = max(1, min(60, int(body.get("timeout_minutes", 10))))
+    except (TypeError, ValueError, OverflowError):
+        return _error("حد الإجراءات أو مدة timeout غير صالحة")
+
+    config = {
+        "enabled": enabled,
+        "kill_switch": False,
+        "channels": sorted(normalized_channels),
+        "detection_types": list(dict.fromkeys(detections)),
+        "sensitivity": sensitivity,
+        "automatic_actions": list(dict.fromkeys(actions)),
+        "allow_ai_ban": allow_ai_ban,
+        "max_actions_per_hour": max_actions,
+        "timeout_minutes": timeout_minutes,
+    }
+    if not isinstance(ai_settings, dict):
+        ai_settings = {}
+    ai_settings["moderation"] = config
+    settings["ai"] = ai_settings
+    legacy = settings.setdefault("atria", {})
+    if isinstance(legacy, dict):
+        legacy.update(moderation_enabled=enabled, timeout_minutes=timeout_minutes)
+    save_settings(settings)
+    ranks.log_action(
+        int(session.get("user_id") or 0),
+        session.get("name", "Dashboard"),
+        "ai_moderation_settings",
+        f"enabled={enabled} channels={len(normalized_channels)} actions={','.join(config['automatic_actions'])}",
+        "dashboard",
+    )
+    return _json_response({"ok": True, "config": config})
+
+
+async def api_ai_chat_test(request: web.Request) -> web.Response:
+    require_permission(request, "manage_settings")
+    try:
+        body = await request.json()
+    except Exception:
+        return _error("طلب غير صالح")
+    if not isinstance(body, dict):
+        return _error("طلب غير صالح")
+    prompt = body.get("prompt")
+    if not isinstance(prompt, str) or not prompt.strip() or len(prompt) > 2000:
+        return _error("اكتب رسالة صالحة لا تتجاوز 2000 حرف")
+    settings = load_settings()
+    ai_settings = settings.get("ai", {})
+    config = ai_settings.get("chat", {}) if isinstance(ai_settings, dict) else {}
+    if not isinstance(config, dict):
+        config = {}
+    try:
+        answer = await ai_chat_service.test_prompt(prompt, config)
+        return _json_response({"ok": True, "answer": answer[:4000]})
+    except (RuntimeError, ValueError):
+        logger.exception("Dashboard AI Chat test failed")
+        return _error("AI service is temporarily unavailable.", 502)
+
+
+async def api_ai_chat_logs(request: web.Request) -> web.Response:
+    require_permission(request, "manage_settings")
+    channel_id = request.query.get("channel_id", "")
+    if not channel_id.isdigit():
+        return _error("اختر قناة AI Chat")
+    settings = load_settings()
+    ai_settings = settings.get("ai", {})
+    config = ai_settings.get("chat", {}) if isinstance(ai_settings, dict) else {}
+    allowed = config.get("allowed_channels", []) if isinstance(config, dict) else []
+    if not isinstance(allowed, list) or channel_id not in {str(value) for value in allowed}:
+        return _error("سجل المحادثة متاح للقنوات المسموحة فقط", 403)
+    bot = request.app.get("bot")
+    guild = next(
+        (item for item in getattr(bot, "guilds", []) if item.get_channel(int(channel_id)) is not None),
+        None,
+    )
+    if guild is None:
+        return _error("القناة غير متاحة للبوت", 404)
+    try:
+        limit = max(1, min(500, int(request.query.get("limit", "100"))))
+    except (TypeError, ValueError, OverflowError):
+        return _error("قيمة limit غير صالحة")
+    return _json_response({"ok": True, "messages": ai_store.recent_chat_entries(guild.id, int(channel_id), limit)})
+
+
+async def api_ai_moderation_kill(request: web.Request) -> web.Response:
+    session = require_permission(request, "manage_settings")
+    settings = load_settings()
+    ai_settings = settings.setdefault("ai", {})
+    if not isinstance(ai_settings, dict):
+        ai_settings = {}
+        settings["ai"] = ai_settings
+    moderation = ai_settings.setdefault("moderation", {})
+    if not isinstance(moderation, dict):
+        moderation = {}
+        ai_settings["moderation"] = moderation
+    moderation.update(enabled=False, kill_switch=True)
+    legacy_moderation = settings.setdefault("atria", {})
+    if isinstance(legacy_moderation, dict):
+        legacy_moderation["moderation_enabled"] = False
+    save_settings(settings)
+    ranks.log_action(
+        int(session.get("user_id") or 0),
+        session.get("name", "Dashboard"),
+        "ai_moderation_kill",
+        "Emergency AI moderation kill switch activated",
+        "dashboard",
+    )
+    logger.warning("AI moderation emergency kill switch activated by %s", session.get("name", "Dashboard"))
+    return _json_response({"ok": True, "enabled": False, "kill_switch": True})
+
+
+async def api_ai_moderation_logs(request: web.Request) -> web.Response:
+    require_permission(request, "view_logs")
+    bot = request.app.get("bot")
+    guild_id = request.query.get("guild_id")
+    guild = next(
+        (item for item in getattr(bot, "guilds", []) if str(item.id) == str(guild_id)),
+        None,
+    ) if guild_id else (bot.guilds[0] if bot and bot.guilds else None)
+    if guild is None:
+        return _error("السيرفر غير متاح للبوت", 404)
+    try:
+        limit = max(1, min(500, int(request.query.get("limit", "100"))))
+    except (TypeError, ValueError, OverflowError):
+        return _error("قيمة limit غير صالحة")
+    return _json_response({
+        "ok": True,
+        "logs": ai_store.recent_moderation(guild.id, limit),
+    })
+
+
+async def api_moderation_warnings(request: web.Request) -> web.Response:
+    require_permission(request, "view_logs")
+    bot = request.app.get("bot")
+    guild_id = request.query.get("guild_id")
+    guild = next(
+        (item for item in getattr(bot, "guilds", []) if str(item.id) == str(guild_id)),
+        None,
+    ) if guild_id else (bot.guilds[0] if bot and bot.guilds else None)
+    if guild is None:
+        return _error("السيرفر غير متاح للبوت", 404)
+    try:
+        limit = max(1, min(500, int(request.query.get("limit", "100"))))
+        member_id = request.query.get("member_id")
+        moderator_id = request.query.get("moderator_id")
+        if member_id is not None and not member_id.isdigit():
+            return _error("Member ID غير صالح")
+        if moderator_id is not None and not moderator_id.isdigit():
+            return _error("Moderator ID غير صالح")
+    except (TypeError, ValueError, OverflowError):
+        return _error("معاملات البحث غير صالحة")
+    warnings = ai_store.recent_guild_warnings(
+        guild.id,
+        limit,
+        int(member_id) if member_id else None,
+        int(moderator_id) if moderator_id else None,
+    )
+    for item in warnings:
+        item["member_name"] = resolve_name(bot, item["user_id"])
+        item["moderator_name"] = resolve_name(bot, item["moderator_id"])
+    query = (request.query.get("q") or "").strip().lower()[:100]
+    if query:
+        warnings = [
+            item for item in warnings
+            if query in f"{item['user_id']} {item['member_name']} {item['moderator_id']} {item['moderator_name']} {item['reason']}".lower()
+        ]
+    return _json_response({"ok": True, "warnings": warnings})
+
+
+async def api_voice_targets(request: web.Request) -> web.Response:
+    require_permission(request, "move_members")
+    bot = request.app.get("bot")
+    guilds = []
+    for guild in getattr(bot, "guilds", []):
+        voice_client = guild.voice_client
+        guilds.append({
+            "id": str(guild.id),
+            "name": guild.name,
+            "connected_channel_id": str(voice_client.channel.id) if voice_client and voice_client.is_connected() else None,
+            "channels": [
+                {"id": str(channel.id), "name": channel.name}
+                for channel in [*guild.voice_channels, *guild.stage_channels]
+            ],
+        })
+    return _json_response({"ok": True, "guilds": guilds})
+
+
+async def api_voice_action(request: web.Request) -> web.Response:
+    session = require_permission(request, "move_members")
+    try:
+        body = await request.json()
+    except Exception:
+        return _error("طلب غير صالح")
+    if not isinstance(body, dict):
+        return _error("طلب غير صالح")
+    action = body.get("action")
+    guild_id = body.get("guild_id")
+    channel_id = body.get("channel_id")
+    if action not in {"join", "leave"} or not str(guild_id or "").isdigit():
+        return _error("إجراء أو سيرفر غير صالح")
+    bot = request.app.get("bot")
+    guild = next((item for item in getattr(bot, "guilds", []) if str(item.id) == str(guild_id)), None)
+    if guild is None:
+        return _error("السيرفر غير متاح للبوت", 404)
+    try:
+        voice_client = guild.voice_client
+        if action == "leave":
+            if voice_client is None or not voice_client.is_connected():
+                return _error("البوت غير متصل بقناة صوتية", 409)
+            channel_name = voice_client.channel.name
+            await voice_client.disconnect(force=True)
+            result_channel_id = None
+        else:
+            if not str(channel_id or "").isdigit():
+                return _error("اختر قناة صوتية")
+            channel = guild.get_channel(int(channel_id))
+            if not isinstance(channel, (discord.VoiceChannel, discord.StageChannel)):
+                return _error("القناة الصوتية غير موجودة في السيرفر", 404)
+            bot_member = guild.me
+            if bot_member is None or not channel.permissions_for(bot_member).connect:
+                return _error("البوت لا يملك صلاحية الاتصال بهذه القناة", 403)
+            if voice_client and voice_client.is_connected():
+                if voice_client.channel.id != channel.id:
+                    await voice_client.move_to(channel)
+            else:
+                await channel.connect(timeout=10, reconnect=True)
+            channel_name = channel.name
+            result_channel_id = str(channel.id)
+    except discord.Forbidden:
+        return _error("Discord رفض اتصال الصوت بسبب الصلاحيات", 403)
+    except discord.HTTPException:
+        logger.exception("Voice action failed guild=%s action=%s", guild.id, action)
+        return _error("تعذر تنفيذ عملية الصوت عبر Discord", 502)
+    actor_id = int(session.get("user_id") or 0)
+    try:
+        ranks.log_action(actor_id, session.get("name", "Dashboard"), f"voice_{action}", f"guild={guild.id} channel={channel_name}", "dashboard")
+    except Exception:
+        logger.exception("Could not audit Dashboard voice action")
+    logger.info("voice_action guild=%s channel=%s action=%s", guild.id, channel_name, action)
+    return _json_response({"ok": True, "action": action, "channel_id": result_channel_id, "channel_name": channel_name})
+
+
+def _dm_guild(bot, guild_id):
+    if not str(guild_id or "").isdigit():
+        return None
+    return next((guild for guild in getattr(bot, "guilds", []) if str(guild.id) == str(guild_id)), None)
+
+
+def _audit_dm(session, action, details):
+    try:
+        ranks.log_action(
+            int(session.get("user_id") or 0),
+            session.get("name", "Dashboard"),
+            action,
+            details,
+            "dashboard",
+        )
+    except Exception:
+        logger.exception("Could not persist DM audit event action=%s", action)
+
+
+async def _dm_member(guild, member_id):
+    if not str(member_id or "").isdigit():
+        return None
+    member = guild.get_member(int(member_id))
+    if member is not None:
+        return member
+    try:
+        return await guild.fetch_member(int(member_id))
+    except discord.NotFound:
+        return None
+
+
+def _dm_variables(bot, guild, member, session, reason=""):
+    settings = load_settings()
+    bot_config = settings.get("bot", {})
+    warning_count = ai_store.count_warnings(guild.id, member.id)
+    return {
+        "user": member.mention,
+        "username": member.name,
+        "server": guild.name,
+        "member_count": guild.member_count or 0,
+        "moderator": session.get("name", "Staff"),
+        "reason": str(reason)[:1000],
+        "warnings": warning_count,
+        "timestamp": discord.utils.utcnow().isoformat(),
+        "server_icon": guild.icon.url if guild.icon else "",
+        "bot_avatar": bot.user.display_avatar.url if bot and bot.user else "",
+        "primary_color": bot_config.get("embed_color", "#F5A623"),
+        "accent_color": f"#{guild.primary_color.value:06X}" if guild.primary_color else bot_config.get("success_color", "#2ECC71"),
+    }
+
+
+async def api_dm_center(request: web.Request) -> web.Response:
+    require_permission(request, "dm_members")
+    bot = request.app.get("bot")
+    bot_config = load_settings().get("bot", {})
+    bot_avatar = bot.user.display_avatar.url if bot and bot.user else ""
+    guilds = [{
+        "id": str(guild.id),
+        "name": guild.name,
+        "icon": guild.icon.url if guild.icon else "",
+        "member_count": guild.member_count or 0,
+        "primary_color": f"#{guild.primary_color.value:06X}" if guild.primary_color and guild.primary_color.value else bot_config.get("embed_color", "#F5A623"),
+        "accent_color": bot_config.get("success_color", "#2ECC71"),
+        "bot_name": str(bot.user.name) if bot and bot.user else "Vixen",
+        "bot_avatar": bot_avatar,
+    } for guild in getattr(bot, "guilds", [])]
+    return _json_response({"ok": True, "guilds": guilds})
+
+
+async def api_dm_members(request: web.Request) -> web.Response:
+    require_permission(request, "dm_members")
+    guild = _dm_guild(request.app.get("bot"), request.query.get("guild_id"))
+    if guild is None:
+        return _error("السيرفر غير متاح للبوت", 404)
+    query = (request.query.get("q") or "").strip().lower()[:100]
+    members = []
+    for member in getattr(guild, "members", []):
+        haystack = f"{member.id} {member.name} {member.display_name}".lower()
+        if query and query not in haystack:
+            continue
+        members.append({
+            "id": str(member.id),
+            "username": member.name,
+            "display_name": member.display_name,
+            "avatar": member.display_avatar.url,
+            "roles": [role.name for role in member.roles if not role.is_default()],
+            "is_bot": member.bot,
+        })
+        if len(members) >= 100:
+            break
+    return _json_response({"ok": True, "members": members})
+
+
+async def api_dm_templates(request: web.Request) -> web.Response:
+    session = require_permission(request, "dm_members")
+    bot = request.app.get("bot")
+    if request.method == "GET":
+        guild = _dm_guild(bot, request.query.get("guild_id"))
+        if guild is None:
+            return _error("السيرفر غير متاح للبوت", 404)
+        return _json_response({"ok": True, "templates": dm_store.list_templates(guild.id)})
+
+    try:
+        body = await request.json()
+    except Exception:
+        return _error("طلب غير صالح")
+    if not isinstance(body, dict):
+        return _error("طلب غير صالح")
+    guild = _dm_guild(bot, body.get("guild_id"))
+    if guild is None:
+        return _error("السيرفر غير متاح للبوت", 404)
+    action = body.get("action", "save")
+    raw_template_id = body.get("template_id")
+    if raw_template_id is not None and not str(raw_template_id).isdigit():
+        return _error("معرّف القالب غير صالح")
+    if action in {"delete", "duplicate"} and raw_template_id is None:
+        return _error("اختر قالبًا أولًا")
+    try:
+        if action == "delete":
+            if not dm_store.delete_template(guild.id, body.get("template_id")):
+                return _error("القالب غير موجود", 404)
+            result = {"deleted": True}
+        elif action == "duplicate":
+            new_name = str(body.get("name", "")).strip()
+            if not new_name or len(new_name) > 100:
+                return _error("اسم النسخة مطلوب (حد أقصى 100 حرف)")
+            new_id = dm_store.duplicate_template(
+                guild.id, body.get("template_id"), new_name, session.get("user_id", 0)
+            )
+            if new_id is None:
+                return _error("القالب غير موجود", 404)
+            result = {"template_id": new_id}
+        elif action == "install_defaults":
+            existing = {item["name"].casefold() for item in dm_store.list_templates(guild.id)}
+            created = 0
+            for name, embed_design in DM_STARTER_TEMPLATES:
+                if name.casefold() in existing:
+                    continue
+                dm_store.create_template(guild.id, name, embed_design, int(session.get("user_id") or 0))
+                created += 1
+            result = {"created": created}
+        elif action == "save":
+            name = str(body.get("name", "")).strip()
+            design = body.get("embed")
+            if not name or len(name) > 100:
+                return _error("اسم القالب مطلوب (حد أقصى 100 حرف)")
+            render_embed(design, {})
+            template_id = body.get("template_id")
+            if template_id:
+                if not dm_store.update_template(guild.id, template_id, name, design):
+                    return _error("القالب غير موجود", 404)
+                result = {"template_id": int(template_id)}
+            else:
+                result = {"template_id": dm_store.create_template(guild.id, name, design, session.get("user_id", 0))}
+        else:
+            return _error("عملية القوالب غير صالحة")
+    except ValueError as exc:
+        return _error(str(exc))
+    except sqlite3.IntegrityError:
+        return _error("يوجد قالب بهذا الاسم في السيرفر", 409)
+    _audit_dm(session, f"dm_template_{action}", f"guild={guild.id} template={result.get('template_id', '')}")
+    return _json_response({"ok": True, **result})
+
+
+async def api_dm_preview(request: web.Request) -> web.Response:
+    session = require_permission(request, "dm_members")
+    try:
+        body = await request.json()
+    except Exception:
+        return _error("طلب غير صالح")
+    if not isinstance(body, dict):
+        return _error("طلب غير صالح")
+    bot = request.app.get("bot")
+    guild = _dm_guild(bot, body.get("guild_id"))
+    if guild is None:
+        return _error("السيرفر غير متاح للبوت", 404)
+    member = await _dm_member(guild, body.get("member_id"))
+    if member is None:
+        return _error("العضو غير موجود في السيرفر", 404)
+    design = body.get("embed")
+    template_id = body.get("template_id")
+    if template_id is not None and not str(template_id).isdigit():
+        return _error("معرّف القالب غير صالح")
+    if template_id and not isinstance(design, dict):
+        template = dm_store.get_template(guild.id, template_id)
+        if template is None:
+            return _error("القالب غير موجود", 404)
+        design = template["embed"]
+    try:
+        embed = render_embed(design, _dm_variables(bot, guild, member, session, body.get("reason", "")))
+    except ValueError as exc:
+        return _error(str(exc))
+    now = time.time()
+    for token, preview in list(DM_PREVIEW_TOKENS.items()):
+        if preview["expires_at"] <= now:
+            DM_PREVIEW_TOKENS.pop(token, None)
+    while len(DM_PREVIEW_TOKENS) >= 5000:
+        DM_PREVIEW_TOKENS.pop(next(iter(DM_PREVIEW_TOKENS)))
+    preview_token = secrets.token_urlsafe(32)
+    DM_PREVIEW_TOKENS[preview_token] = {
+        "sender_id": int(session.get("user_id") or 0),
+        "guild_id": guild.id,
+        "recipient_id": member.id,
+        "template_id": int(template_id) if template_id and str(template_id).isdigit() else None,
+        "embed": embed.to_dict(),
+        "expires_at": now + DM_PREVIEW_TTL,
+    }
+    return _json_response({"ok": True, "preview_token": preview_token, "recipient": {"id": str(member.id), "name": member.display_name}, "embed": embed.to_dict()})
+
+
+async def api_dm_send(request: web.Request) -> web.Response:
+    session = require_permission(request, "dm_members")
+    try:
+        body = await request.json()
+    except Exception:
+        return _error("طلب غير صالح")
+    if not isinstance(body, dict) or body.get("confirm") is not True or not isinstance(body.get("preview_token"), str):
+        return _error("عاين الرسالة وأكّد الإرسال قبل المتابعة")
+    preview = DM_PREVIEW_TOKENS.pop(body["preview_token"], None)
+    if preview is None or preview["expires_at"] <= time.time():
+        return _error("انتهت المعاينة أو استُخدمت سابقًا؛ أنشئ معاينة جديدة", 409)
+    sender_id = int(session.get("user_id") or 0)
+    if sender_id != preview["sender_id"]:
+        return _error("معاينة الرسالة لا تطابق جلسة المرسل", 403)
+    if str(body.get("guild_id")) != str(preview["guild_id"]) or str(body.get("member_id")) != str(preview["recipient_id"]):
+        return _error("السيرفر أو المستلم تغير بعد المعاينة", 409)
+    bot = request.app.get("bot")
+    guild = _dm_guild(bot, preview["guild_id"])
+    if guild is None:
+        return _error("السيرفر غير متاح للبوت", 404)
+    member = await _dm_member(guild, preview["recipient_id"])
+    if member is None:
+        return _error("العضو غير موجود في السيرفر", 404)
+    template_id = preview["template_id"]
+    embed_json = preview["embed"]
+    try:
+        embed = discord.Embed.from_dict(embed_json)
+    except (TypeError, ValueError):
+        return _error("المعاينة المحفوظة لم تعد صالحة", 409)
+    if not dm_store.reserve_send(sender_id, maximum=20):
+        return _error("وصلت حد 20 رسالة مباشرة بالساعة", 429)
+    try:
+        await member.send(embed=embed)
+    except (discord.Forbidden, discord.HTTPException) as exc:
+        error = "المستلم أغلق الرسائل الخاصة" if isinstance(exc, discord.Forbidden) else f"Discord HTTP {exc.status}"
+        dm_id = dm_store.record_send(guild.id, member.id, sender_id, template_id, "failed", error, embed_json)
+        _audit_dm(session, "dm_send_failed", f"guild={guild.id} member={member.id} dm_id={dm_id} error={error}")
+        return _error(error, 502)
+    dm_id = dm_store.record_send(guild.id, member.id, sender_id, template_id, "success", "", embed_json)
+    _audit_dm(session, "dm_send", f"guild={guild.id} member={member.id} dm_id={dm_id}")
+    logger.info("Dashboard DM sent guild=%s recipient=%s sender=%s dm_id=%s", guild.id, member.id, sender_id, dm_id)
+    return _json_response({"ok": True, "status": "success", "dm_id": dm_id, "recipient_id": str(member.id)})
+
+
+async def api_dm_history(request: web.Request) -> web.Response:
+    require_permission(request, "dm_members")
+    guild = _dm_guild(request.app.get("bot"), request.query.get("guild_id"))
+    if guild is None:
+        return _error("السيرفر غير متاح للبوت", 404)
+    try:
+        limit = max(1, min(500, int(request.query.get("limit", "100"))))
+    except (TypeError, ValueError, OverflowError):
+        return _error("قيمة limit غير صالحة")
+    history = dm_store.recent_history(guild.id, limit)
+    return _json_response({"ok": True, "history": history})
 
 async def api_money(request: web.Request) -> web.Response:
     session = require_permission(request, "")  # الصلاحية تتحدد حسب العملية تحت
@@ -1024,6 +1812,30 @@ async def api_logs(request: web.Request) -> web.Response:
     return _json_response({"ok": True, "logs": logs})
 
 
+async def api_terminal_stream(request: web.Request) -> web.StreamResponse:
+    require_permission(request, "view_logs")
+    response = web.StreamResponse(
+        status=200,
+        headers={"Content-Type": "text/event-stream", "Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+    queue = live_terminal.subscribe()
+    try:
+        await response.prepare(request)
+        while True:
+            try:
+                event = await asyncio.wait_for(queue.get(), timeout=15)
+            except asyncio.TimeoutError:
+                await response.write(b": heartbeat\n\n")
+                continue
+            payload = json.dumps(event, ensure_ascii=False, separators=(",", ":"))
+            await response.write(f"data: {payload}\n\n".encode("utf-8"))
+    except ConnectionResetError:
+        pass
+    finally:
+        live_terminal.unsubscribe(queue)
+    return response
+
+
 async def api_market(request: web.Request) -> web.Response:
     require_permission(request, "view_stats")
     cfg = load_settings().get("stocks", {})
@@ -1096,6 +1908,28 @@ def create_web_app(bot) -> web.Application:
     app.router.add_get("/api/commands", api_commands)
     app.router.add_post("/api/commands/execute", api_command_execute)
     app.router.add_post("/api/atria", api_atria)
+    app.router.add_get("/api/ai/status", api_ai_status)
+    app.router.add_post("/api/ai/test", api_ai_test)
+    app.router.add_post("/api/ai/moderation/kill", api_ai_moderation_kill)
+    app.router.add_route("GET", "/api/ai/moderation/settings", api_ai_moderation_settings)
+    app.router.add_route("POST", "/api/ai/moderation/settings", api_ai_moderation_settings)
+    app.router.add_get("/api/ai/moderation/logs", api_ai_moderation_logs)
+    app.router.add_get("/api/moderation/warnings", api_moderation_warnings)
+    app.router.add_get("/api/voice/targets", api_voice_targets)
+    app.router.add_post("/api/voice/action", api_voice_action)
+    app.router.add_get("/api/bot/profile", api_bot_profile)
+    app.router.add_post("/api/bot/presence", api_bot_presence)
+    app.router.add_get("/api/dm/center", api_dm_center)
+    app.router.add_get("/api/dm/members", api_dm_members)
+    app.router.add_route("GET", "/api/dm/templates", api_dm_templates)
+    app.router.add_route("POST", "/api/dm/templates", api_dm_templates)
+    app.router.add_post("/api/dm/preview", api_dm_preview)
+    app.router.add_post("/api/dm/send", api_dm_send)
+    app.router.add_get("/api/dm/history", api_dm_history)
+    app.router.add_route("GET", "/api/ai/chat/settings", api_ai_chat_settings)
+    app.router.add_route("POST", "/api/ai/chat/settings", api_ai_chat_settings)
+    app.router.add_post("/api/ai/chat/test", api_ai_chat_test)
+    app.router.add_get("/api/ai/chat/logs", api_ai_chat_logs)
     app.router.add_post("/api/money", api_money)
     app.router.add_get("/api/staff", api_staff)
     app.router.add_post("/api/staff/code", api_staff_code)
@@ -1104,6 +1938,7 @@ def create_web_app(bot) -> web.Application:
     app.router.add_get("/api/settings", api_settings_get)
     app.router.add_post("/api/settings", api_settings_save)
     app.router.add_get("/api/logs", api_logs)
+    app.router.add_get("/api/terminal/stream", api_terminal_stream)
     app.router.add_get("/api/market", api_market)
 
     if (DASHBOARD_DIR / "assets").exists():
@@ -1125,6 +1960,7 @@ async def start_web_server(bot) -> bool:
     except (TypeError, ValueError):
         port = 8080
 
+    install_live_terminal()
     app = create_web_app(bot)
     runner = web.AppRunner(app)
     try:
